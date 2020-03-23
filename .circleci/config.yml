@@ -1,0 +1,154 @@
+version: 2.1
+
+executors:
+  default:
+    macos:
+      xcode: "11.2.1"
+    working_directory: /Users/distiller/project
+    environment:
+      FL_OUTPUT_DIR: output
+      TZ: Asia/Tokyo
+
+commands:
+  # Saves workspace to be loaded later into workflow
+  save_workspace:
+    steps:
+      - persist_to_workspace:
+          root: /Users/distiller/project
+          paths:
+            - .
+  # Save artifacts from output directory
+  save_artifacts:
+    steps:
+      - store_artifacts:
+          path: /Users/distiller/project/output
+          destination: output
+  # Installs Ruby Gems
+  install_rubygems:
+        steps:
+          - run:
+              name: Set Ruby Version
+              command: echo 'chruby ruby-2.6' >> ~/.bash_profile  # Replace 2.6 with the specific version of Ruby here
+          # Restore bundle cache
+          - restore_cache:
+              keys:
+                - v1-gems-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}
+          # Install the bundler
+          - run:
+              name: Bundle Install
+              command:  bundle check || bundle install --path vendor/bundle
+          # Store bundle cache for Ruby dependencies
+          - save_cache:
+              key: v1-gems-{{ checksum ".ruby-version" }}-{{ checksum "Gemfile.lock" }}
+              paths:
+                - vendor/bundle
+  # Installs Node Modules
+  install_npm_modules:
+        steps:
+            - restore_cache:
+                keys:
+                  - v1-nodejs-{{ checksum "package-lock.json" }}
+            - run:
+                name: Install NodeJS package
+                command: npm install
+            - save_cache:
+                key: v1-nodejs-{{ checksum "package-lock.json" }}
+                paths:
+                    - node_modules
+  # Install Pods  
+  install_pods:
+        steps:
+          - restore_cache:
+              key: v1-pods-{{ checksum "Podfile.lock" }}
+          - run:
+              name: Install CocoaPods
+              command: |
+                curl https://cocoapods-specs.circleci.com/fetch-cocoapods-repo-from-s3.sh | bash -s cf
+                bundle exec pod install
+          - save_cache:
+              key: v1-pods-{{ checksum "Podfile.lock" }}
+              paths:
+                - ./Pods
+  # Install Carthage Dependencies
+  install_carthage:
+        steps:
+        - run:
+            name: Echo Swift version
+            command: swift -version > .swiftversion
+        - restore_cache:
+            keys:
+              - v1-carthage-{{ checksum ".swiftversion" }}-{{ checksum "Cartfile.resolved" }}
+        - run:
+            name: Bootstrap Carthage
+            command: carthage bootstrap --no-use-binaries --cache-builds --platform ios --configuration Release 
+            # command: |
+            # if ! cmp -s Cartfile.resolved Carthage/Cartfile.resolved; then
+            #   carthage bootstrap --no-use-binaries --cache-builds --platform ios --configuration Release 
+            #   cp Cartfile.resolved Carthage/
+            # fi
+        - save_cache:
+            key: v1-carthage-{{ checksum ".swiftversion" }}-{{ checksum "Cartfile.resolved" }}
+            paths:
+              - Carthage
+
+jobs:
+  # Sets up and load dependencies
+  setup:
+    executor: default
+    steps:
+      - checkout
+      - install_rubygems
+      - install_npm_modules
+      - install_pods
+      - install_carthage
+      - persist_to_workspace:
+          root: /Users/distiller/project
+          paths:
+            - .
+
+  test:
+    executor: default
+    steps:
+      - attach_workspace:
+          at: /Users/distiller/project
+      - run:
+          name: Build for testing and run tests
+          command: bundle exec fastlane ios test
+      - store_artifacts:
+          path: output
+      - store_test_results:
+          path: output/scan
+
+  deploy:
+    executor:
+      name: default
+    parameters:
+      build_type:
+        type: enum
+        enum: ['alpha','beta', 'prod']
+        default: alpha
+    steps:
+      - attach_workspace:
+          at: /Users/distiller/project
+      - run:
+          name: Install certs and profiles
+          command: bundle exec fastlane ios setup_provisioning_profiles environment:<< parameters.build_type >>
+      - run:
+          name: Build ipa
+          command: bundle exec fastlane ios << parameters.build_type >>
+          when: on_success
+      - store_artifacts:
+          path: output
+          when: on_success
+      
+workflows:
+  main:
+    jobs:
+      - setup
+      - test:
+          requires:
+            - setup
+      
+
+
+
